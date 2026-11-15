@@ -30,8 +30,7 @@ Most of these were written some time ago while I was learning. My coding style a
 
 - The scrapers were written for educational purposes.
 - Some projects use older coding patterns (global variables, minimal error handling, etc.).
-- Feel free to explore, but keep in mind that these are learning projects.
 
 ---
 
-*Created by Neizvesnno*
+*Created by Pavlo*
