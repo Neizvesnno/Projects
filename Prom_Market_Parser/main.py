@@ -8,7 +8,7 @@ import math
 import time
 import os
 
-headers: dict = {"User-Agent": "..."}
+headers: dict = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"}
 canner: bool = True
 kol_strs: int = 1
 data_len: int = 0
