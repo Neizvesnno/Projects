@@ -11,7 +11,7 @@ start_hard = 10
 last_hard = 20
 last_un = 0
 random_count = random.randint(start_hard, last_hard)
-name_user = 'NEIZVESNNO'
+name_user = 'Guest'
 window_open = False
 old_user = False
 lose = False
@@ -38,7 +38,7 @@ def sql_start():
         #  cur.execute("DROP TABLE IF EXISTS players")
         cur.execute("""CREATE TABLE IF NOT EXISTS players (
             user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL DEFAULT NEIZVESNNO,
+            name TEXT NOT NULL DEFAULT 'Guest',
             score INTEGER NOT NULL DEFAULT 0
             )""")
 
@@ -340,7 +340,7 @@ def main():
     #  run_music()
     name_user = Account.answeriti
     if name_user == '' or name_user == ' ':
-        name_user = 'NEIZVESNNO'
+        name_user = 'Guest'
     sql_start()
     #  print(f"You\'r account: {name_user}")
     #  print(f'Old User: {old_user}')

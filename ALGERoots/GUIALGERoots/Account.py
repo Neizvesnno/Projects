@@ -9,7 +9,7 @@ def have_acc():
     account_w.destroy()
 
 
-answeriti = 'NEIZVESNNO'
+answeriti = 'Guest'
 
 account_w = tk.Tk()
 
