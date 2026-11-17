@@ -8,7 +8,7 @@ import random
 import os
 
 BASE_URL = "https://www.olx.ua/uk/list/q-{query}/"
-MAX_PAGES = 25  # OLX не віддає більше 25 сторінок видачі
+MAX_PAGES = 25
 
 data_len: int = 0
 row_numo: int = 0
@@ -28,35 +28,29 @@ def get_soup(url: str) -> tuple[BeautifulSoup, str]:
     response = requests.get(url, timeout=20)
     response.raise_for_status()
     soup = BeautifulSoup(response.content, "html.parser")
-    # Прибираємо вбудовані <style>, інакше їхній CSS потрапляє в get_text()
     for style in soup.find_all("style"):
         style.decompose()
     return soup, response.url
 
 
 def clean_link(href: str, page_url: str) -> str:
-    # Абсолютне посилання без службових параметрів на кшталт ?search_reason=
     parts = urlsplit(urljoin(page_url, href))
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def parse_listings(soup: BeautifulSoup, page_url: str) -> list[list[str]]:
-    # Перша сітка містить результати пошуку. Якщо нічого не знайдено,
-    # вона порожня, а OLX показує другу сітку з рекламними оголошеннями.
     grid = soup.select_one('[data-testid="listing-grid"]')
     if grid is None:
         return []
 
     listings = []
-    # Кожну картку розбираємо окремо, щоб назва, ціна й посилання
-    # гарантовано належали одному оголошенню.
     for card in grid.select('[data-cy="l-card"]'):
         link_tag = card.select_one('a[data-testid="card-title-link"]') or card.select_one("a[href]")
         if link_tag is None or not link_tag.get("href"):
             continue
 
         ad_id = card.get("id") or link_tag["href"]
-        if ad_id in seen_ids:  # ТОП-оголошення повторюються на різних сторінках
+        if ad_id in seen_ids:
             continue
         seen_ids.add(ad_id)
 
@@ -101,7 +95,6 @@ def save_to_excel(data: list[list[str]]):
             col_letter = get_column_letter(col_num)
             worksheet[f'{col_letter}1'] = value
 
-    # Перший вільний рядок одразу після заголовка або вже записаних даних
     last_row = worksheet.max_row
 
     for row_num, info in enumerate(data, start=1):
@@ -136,7 +129,6 @@ def main():
         pass
 
     query = input("Введіть пошуковий запит: ").strip()
-    # OLX використовує дефіси замість пробілів; кирилицю та спецсимволи кодуємо
     search = quote("-".join(query.split()), safe="-")
 
     raw_stop = input("Слова для виключення через кому (Enter — без фільтра): ")
