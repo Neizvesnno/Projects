@@ -1,16 +1,27 @@
+import re
+import time
+from datetime import datetime, timedelta
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+
 import requests
 from bs4 import BeautifulSoup
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl import Workbook
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
-import random
-import os
 
 from cache import ListingCache, diff_listings
+from report import write_report
 
 BASE_URL = "https://www.olx.ua/uk/list/q-{query}/"
 MAX_PAGES = 25
+RESULTS_FILE = "results.xlsx"
+
+KNOWN_CONDITIONS = ("Нове", "Вживане", "Відновлене", "Пошкоджене")
+CONDITION_ORDER = {name: index for index, name in enumerate(KNOWN_CONDITIONS)}
+
+MONTHS = {
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
+}
+
+CURRENCIES = (("грн", "UAH"), ("$", "USD"), ("€", "EUR"))
 
 
 def build_url(search: str, page: int) -> str:
@@ -34,11 +45,71 @@ def clean_link(href: str, page_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def parse_price(text: str) -> dict:
+    lowered = text.lower()
+    result = {"price": None, "currency": "", "price_type": "Не вказана"}
+    if not text:
+        return result
+    if "безкоштовно" in lowered:
+        result["price_type"] = "Безкоштовно"
+        return result
+
+    match = re.search(r"\d[\d\s]*(?:[.,]\d+)?", text)
+    if match is None:
+        result["price_type"] = text
+        return result
+
+    result["price"] = float(re.sub(r"\s", "", match.group()).replace(",", "."))
+    result["currency"] = next((code for sign, code in CURRENCIES if sign in lowered), "")
+    result["price_type"] = "Договірна" if "договірна" in lowered else "Фіксована"
+    return result
+
+
+def parse_posted(text: str, now: datetime) -> str | None:
+    text = text.strip()
+    match = re.match(r"(Сьогодні|Вчора) о (\d{1,2}):(\d{2})", text)
+    if match:
+        day = now if match.group(1) == "Сьогодні" else now - timedelta(days=1)
+        posted = day.replace(hour=int(match.group(2)), minute=int(match.group(3)),
+                             second=0, microsecond=0)
+        return posted.isoformat()
+
+    match = re.match(r"(\d{1,2}) (\w+) (\d{4})", text)
+    if match and match.group(2) in MONTHS:
+        try:
+            return datetime(int(match.group(3)), MONTHS[match.group(2)], int(match.group(1))).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def parse_location_date(card, now: datetime) -> dict:
+    tag = card.select_one('[data-testid="location-date"]')
+    text = tag.get_text(" ", strip=True) if tag else ""
+    location, _, date_text = text.rpartition(" - ")
+    if not location:
+        location, date_text = text, ""
+    city, _, district = location.partition(",")
+    return {
+        "city": city.strip(),
+        "district": district.strip(),
+        "posted": parse_posted(date_text, now),
+    }
+
+
+def parse_condition(card) -> str:
+    for text in card.stripped_strings:
+        if text in KNOWN_CONDITIONS:
+            return text
+    return ""
+
+
 def parse_listings(soup: BeautifulSoup, page_url: str, seen_ids: set[str]) -> list[dict]:
     grid = soup.select_one('[data-testid="listing-grid"]')
     if grid is None:
         return []
 
+    now = datetime.now()
     listings = []
     for card in grid.select('[data-cy="l-card"]'):
         link_tag = card.select_one('a[data-testid="card-title-link"]') or card.select_one("a[href]")
@@ -52,10 +123,17 @@ def parse_listings(soup: BeautifulSoup, page_url: str, seen_ids: set[str]) -> li
         seen_ids.add(ad_id)
 
         price_tag = card.select_one('[data-testid="ad-price"]')
+        price_text = price_tag.get_text(" ", strip=True) if price_tag else ""
+
         listings.append({
             "id": ad_id,
             "title": link_tag.get_text(" ", strip=True),
-            "price": price_tag.get_text(" ", strip=True) if price_tag else "",
+            "price_text": price_text,
+            **parse_price(price_text),
+            "condition": parse_condition(card),
+            **parse_location_date(card, now),
+            "promoted": "promoted" in link_tag["href"],
+            "delivery": card.select_one('[data-testid="card-delivery-badge"]') is not None,
             "link": link,
         })
     return listings
@@ -93,6 +171,39 @@ def apply_stop_words(listings: list[dict], stop_words: list[str]) -> list[dict]:
             if not any(word in item["title"].lower() for word in stop_words)]
 
 
+def sort_price(item: dict) -> float | None:
+    if item["price_type"] == "Безкоштовно":
+        return 0.0
+    if item["currency"] == "UAH":
+        return item["price"]
+    return None
+
+
+SORT_MODES = {
+    "1": ("ціна, від дешевших",
+          lambda items: sorted(items, key=lambda i: (sort_price(i) is None, sort_price(i) or 0))),
+    "2": ("ціна, від дорожчих",
+          lambda items: sorted(items, key=lambda i: (sort_price(i) is None, -(sort_price(i) or 0)))),
+    "3": ("стан, потім ціна",
+          lambda items: sorted(items, key=lambda i: (CONDITION_ORDER.get(i["condition"], len(CONDITION_ORDER)),
+                                                     sort_price(i) is None, sort_price(i) or 0))),
+    "4": ("дата, спершу новіші",
+          lambda items: sorted(items, key=lambda i: i["posted"] or "", reverse=True)),
+    "5": ("місто, потім ціна",
+          lambda items: sorted(items, key=lambda i: (not i["city"], i["city"],
+                                                     sort_price(i) is None, sort_price(i) or 0))),
+}
+
+
+def ask_sort_mode() -> str:
+    options = ", ".join(f"{key} — {label}" for key, (label, _) in SORT_MODES.items())
+    choice = input(f"Сортування ({options}) [1]: ").strip() or "1"
+    if choice not in SORT_MODES:
+        print("Невідомий варіант, сортую за ціною.")
+        choice = "1"
+    return choice
+
+
 def format_age(seconds: float) -> str:
     minutes = int(seconds // 60)
     if minutes < 60:
@@ -117,76 +228,35 @@ def ask_yes(prompt: str) -> bool:
     return input(prompt).strip().lower() in ("y", "yes", "т", "так", "д", "да")
 
 
-def save_to_excel(data: list[list[str]]):
-    header = ["Назва", "Ціна", "Посилання"]
-    links = ["This is HyperLink", "Touch me", "Click here", "Hello, I'm Link!"]
-
-    try:
-        workbook = load_workbook('results.xlsx')
-    except FileNotFoundError:
-        workbook = Workbook()
-
-    worksheet = workbook.active
-
-    worksheet.column_dimensions['A'].width = 50
-    worksheet.column_dimensions['B'].width = 15
-    worksheet.column_dimensions['C'].width = 20
-
-    if worksheet['A1'].value != header[0] or worksheet['B1'].value != header[1] or worksheet['C1'].value != header[2]:
-        for col_num, value in enumerate(header, start=1):
-            col_letter = get_column_letter(col_num)
-            worksheet[f'{col_letter}1'] = value
-
-    last_row = worksheet.max_row
-
-    for row_num, info in enumerate(data, start=1):
-        for col_num, value in enumerate(info, start=1):
-            col_letter = get_column_letter(col_num)
-            colip = f'{col_letter}{last_row + row_num}'
-            if col_letter == "C":
-                worksheet[colip].hyperlink = value
-                worksheet[colip].value = random.choice(links)
-                worksheet[colip].style = "Hyperlink"
-            else:
-                worksheet[colip] = value
-
-    workbook.save('results.xlsx')
-
-
-def get_listings(search: str, cache: ListingCache) -> list[dict] | None:
+def get_listings(search: str, cache: ListingCache) -> tuple[list[dict] | None, float]:
     entry = cache.get(search)
 
     if entry is not None and cache.is_fresh(entry):
         print(f"Є кеш для цього запиту ({format_age(cache.age(entry))}, "
               f"{len(entry['listings'])} оголошень).")
         if not ask_yes("Оновити з OLX? [y/N]: "):
-            return entry["listings"]
+            return entry["listings"], entry["fetched_at"]
 
     try:
         listings, capped = fetch_all(search)
     except requests.RequestException as error:
         if entry is None:
             print(f"Не вдалося завантажити дані з OLX: {error}")
-            return None
+            return None, time.time()
         print(f"Не вдалося завантажити дані з OLX ({error}). "
               f"Використовую кеш ({format_age(cache.age(entry))}).")
-        return entry["listings"]
+        return entry["listings"], entry["fetched_at"]
 
     if not listings:
-        return listings
+        return listings, time.time()
 
     if entry is not None:
         print_diff(entry, listings, capped)
     cache.put(search, listings, capped)
-    return listings
+    return listings, cache.get(search)["fetched_at"]
 
 
 def main():
-    try:
-        os.remove("results.xlsx")
-    except FileNotFoundError:
-        pass
-
     query = input("Введіть пошуковий запит: ").strip()
     search = quote("-".join(query.lower().split()), safe="-")
     if not search:
@@ -195,8 +265,9 @@ def main():
 
     raw_stop = input("Слова для виключення через кому (Enter — без фільтра): ")
     stop_words = [w.strip().lower() for w in raw_stop.split(",") if w.strip()]
+    sort_mode = ask_sort_mode()
 
-    listings = get_listings(search, ListingCache())
+    listings, fetched_at = get_listings(search, ListingCache())
     if listings is None:
         return
 
@@ -205,8 +276,13 @@ def main():
         print("Нічого не знайдено.")
         return
 
-    save_to_excel([[item["title"], item["price"], item["link"]] for item in filtered])
-    print(f"Excellent, I found {len(filtered)} products!")
+    label, sorter = SORT_MODES[sort_mode]
+    try:
+        write_report(RESULTS_FILE, sorter(filtered), query, datetime.fromtimestamp(fetched_at), label)
+    except PermissionError:
+        print(f"Не вдалося записати {RESULTS_FILE}: закрий файл в Excel і запусти ще раз.")
+        return
+    print(f"Excellent, I found {len(filtered)} products! Звіт збережено в {RESULTS_FILE}")
 
 
 if __name__ == "__main__":

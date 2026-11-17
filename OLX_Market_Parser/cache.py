@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 CACHE_FILE = Path(__file__).with_name("cache.json")
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_TTL = 30 * 60
 CACHE_MAX_AGE = 7 * 24 * 60 * 60
 
