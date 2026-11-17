@@ -1,6 +1,7 @@
 import math
 import statistics
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from openpyxl import Workbook
@@ -9,6 +10,8 @@ from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from tracker import Changes
 
 PRICE_FORMAT = '#,##0 "грн"'
 PERCENT_FORMAT = '+0%;-0%;0%'
@@ -20,30 +23,40 @@ HEADER_FONT = Font(bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="23A094")
 TITLE_FONT = Font(bold=True, size=14)
 SECTION_FONT = Font(bold=True, size=12, color="23A094")
-NO_CONDITION = "Не вказано"
+NOTE_FONT = Font(italic=True, color="666666")
+NOT_SET = "Не вказано"
 
-LISTING_COLUMNS = [
-    ("Назва", 55),
-    ("Ціна, грн", 14),
-    ("Тип ціни", 13),
-    ("Стан", 11),
-    ("Місто", 18),
-    ("Район", 18),
-    ("Дата", 17),
-    ("Від медіани", 12),
-    ("ТОП", 6),
-    ("Доставка", 10),
-    ("Посилання", 11),
-    ("Ціна на сайті", 22),
-]
+
+@dataclass
+class ReportMeta:
+    query: str
+    filters: str
+    fetched_at: datetime
+    sort_label: str
+    total_found: int | None = None
+    changes: Changes | None = None
 
 
 def uah_price(item: dict) -> float | None:
     return item["price"] if item["currency"] == "UAH" else None
 
 
+def table_price(item: dict) -> float | None:
+    return 0 if item["price_type"] == "Безкоштовно" else uah_price(item)
+
+
 def uah_prices(listings: list[dict]) -> list[float]:
     return [price for price in map(uah_price, listings) if price is not None]
+
+
+def seller_label(item: dict) -> str:
+    if item.get("business") is None:
+        return NOT_SET
+    return "Бізнес" if item["business"] else "Приватна особа"
+
+
+def parse_date(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
 
 
 def price_stats(prices: list[float]) -> dict | None:
@@ -109,77 +122,106 @@ def style_header(cells):
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
-def set_link(cell, url: str):
-    cell.value = "Відкрити"
+def set_link(cell, url: str, text: str = "Відкрити"):
+    if not url:
+        return
+    cell.value = text
     cell.hyperlink = url
     cell.style = "Hyperlink"
 
 
+def listing_columns(median: float | None) -> list[tuple]:
+    def deviation(item):
+        price = uah_price(item)
+        return price / median - 1 if price and median else None
+
+    return [
+        ("Назва", 55, lambda i: i["title"], None),
+        ("Ціна, грн", 14, table_price, PRICE_FORMAT),
+        ("Тип ціни", 13, lambda i: i["price_type"], None),
+        ("Стан", 11, lambda i: i["condition"] or NOT_SET, None),
+        ("Продавець", 15, seller_label, None),
+        ("Місто", 18, lambda i: i["city"], None),
+        ("Район", 18, lambda i: i["district"], None),
+        ("Область", 22, lambda i: i["region"], None),
+        ("Опубліковано/піднято", 17, lambda i: parse_date(i["posted"]), DATE_FORMAT),
+        ("Створено", 17, lambda i: parse_date(i["created"]), DATE_FORMAT),
+        ("Від медіани", 12, deviation, PERCENT_FORMAT),
+        ("ТОП", 6, lambda i: "так" if i["promoted"] else "", None),
+        ("Доставка", 10, lambda i: "так" if i["delivery"] else "", None),
+        ("Посилання", 11, "link", None),
+        ("Фото", 8, "photo", None),
+        ("Ім'я продавця", 20, lambda i: i["seller"], None),
+        ("Ціна на сайті", 22, lambda i: i["price_text"], None),
+        ("ID", 12, lambda i: i["id"], None),
+    ]
+
+
+def column_index(columns: list[tuple], header: str) -> int:
+    return next(index for index, column in enumerate(columns, start=1) if column[0] == header)
+
+
 def write_listings_sheet(ws, listings: list[dict], median: float | None, sort_label: str):
     ws.title = "Оголошення"
-    for col, (header, width) in enumerate(LISTING_COLUMNS, start=1):
+    columns = listing_columns(median)
+    for col, (header, width, _, _) in enumerate(columns, start=1):
         ws.cell(row=1, column=col, value=header)
         ws.column_dimensions[get_column_letter(col)].width = width
     style_header(ws[1])
 
     for row, item in enumerate(listings, start=2):
-        price = uah_price(item)
-        if item["price_type"] == "Безкоштовно":
-            price = 0
-        posted = datetime.fromisoformat(item["posted"]) if item["posted"] else None
-        deviation = price / median - 1 if price and median else None
-
-        values = [
-            item["title"], price, item["price_type"], item["condition"] or NO_CONDITION,
-            item["city"], item["district"], posted, deviation,
-            "так" if item["promoted"] else "", "так" if item["delivery"] else "",
-            None, item["price_text"],
-        ]
-        for col, value in enumerate(values, start=1):
-            ws.cell(row=row, column=col, value=value)
-        ws.cell(row=row, column=2).number_format = PRICE_FORMAT
-        ws.cell(row=row, column=7).number_format = DATE_FORMAT
-        ws.cell(row=row, column=8).number_format = PERCENT_FORMAT
-        set_link(ws.cell(row=row, column=11), item["link"])
+        for col, (header, _, getter, fmt) in enumerate(columns, start=1):
+            cell = ws.cell(row=row, column=col)
+            if getter == "link":
+                set_link(cell, item["link"])
+            elif getter == "photo":
+                set_link(cell, item["photo"], "Фото")
+            else:
+                cell.value = getter(item)
+                if fmt:
+                    cell.number_format = fmt
 
     last_row = len(listings) + 1
-    last_col = get_column_letter(len(LISTING_COLUMNS))
+    last_col = get_column_letter(len(columns))
     table = Table(displayName="Listings", ref=f"A1:{last_col}{last_row}")
     table.tableStyleInfo = TableStyleInfo(name="TableStyleLight9", showRowStripes=True)
     ws.add_table(table)
     ws.freeze_panes = "B2"
 
+    price_col = get_column_letter(column_index(columns, "Ціна, грн"))
+    deviation_col = get_column_letter(column_index(columns, "Від медіани"))
     ws.conditional_formatting.add(
-        f"B2:B{last_row}",
+        f"{price_col}2:{price_col}{last_row}",
         ColorScaleRule(start_type="percentile", start_value=5, start_color="63BE7B",
                        mid_type="percentile", mid_value=50, mid_color="FFEB84",
                        end_type="percentile", end_value=95, end_color="F8696B"),
     )
     ws.conditional_formatting.add(
-        f"H2:H{last_row}",
+        f"{deviation_col}2:{deviation_col}{last_row}",
         ColorScaleRule(start_type="num", start_value=-0.5, start_color="63BE7B",
                        mid_type="num", mid_value=0, mid_color="FFFFFF",
                        end_type="num", end_value=0.5, end_color="F8696B"),
     )
 
-    price_range = f"B2:B{last_row}"
+    price_range = f"{price_col}2:{price_col}{last_row}"
     summary = [
         ("Середня ціна", f"=SUBTOTAL(101,{price_range})", PRICE_FORMAT),
         ("Мінімальна ціна", f"=SUBTOTAL(105,{price_range})", PRICE_FORMAT),
         ("Максимальна ціна", f"=SUBTOTAL(104,{price_range})", PRICE_FORMAT),
         ("Оголошень з ціною", f"=SUBTOTAL(102,{price_range})", "0"),
     ]
+    price_index = column_index(columns, "Ціна, грн")
     row = last_row + 2
     ws.cell(row=row, column=1, value="Підсумок (з урахуванням фільтрів таблиці)").font = SECTION_FONT
     for label, formula, fmt in summary:
         row += 1
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
-        cell = ws.cell(row=row, column=2, value=formula)
+        cell = ws.cell(row=row, column=price_index, value=formula)
         cell.number_format = fmt
         cell.font = Font(bold=True)
     ws.cell(row=row + 2, column=1,
             value=f"Початкове сортування: {sort_label}. Кнопки в заголовку таблиці дозволяють "
-                  f"пересортувати й відфільтрувати за будь-яким стовпцем.").font = Font(italic=True, color="666666")
+                  f"пересортувати й відфільтрувати за будь-яким стовпцем.").font = NOTE_FONT
 
 
 class SheetWriter:
@@ -192,7 +234,7 @@ class SheetWriter:
         self.row += 1
 
     def line(self, text: str):
-        self.ws.cell(row=self.row, column=1, value=text).font = Font(color="666666")
+        self.ws.cell(row=self.row, column=1, value=text).font = NOTE_FONT
         self.row += 1
 
     def section(self, text: str):
@@ -222,6 +264,15 @@ class SheetWriter:
             self.row += 1
         return header_row, self.row - 1
 
+    def ad_table(self, headers: list[str], items: list[dict], values, formats: list[str | None], link_col: int):
+        header_row, _ = self.table(headers, [values(item) for item in items], formats)
+        for offset, item in enumerate(items, start=1):
+            set_link(self.ws.cell(row=header_row + offset, column=link_col), item["link"])
+
+
+STAT_HEADERS = ["Кількість", "Частка", "Середня", "Медіана", "Мін", "Макс"]
+STAT_FORMATS = [None, "0", SHARE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT]
+
 
 def group_stats_rows(groups: dict[str, list[dict]], total: int, order: list[str]) -> list[list]:
     rows = []
@@ -236,7 +287,18 @@ def group_stats_rows(groups: dict[str, list[dict]], total: int, order: list[str]
     return rows
 
 
-def write_analysis_sheet(ws, listings: list[dict], query: str, fetched_at: datetime):
+def group_by(listings: list[dict], key) -> dict[str, list[dict]]:
+    groups = defaultdict(list)
+    for item in listings:
+        groups[key(item) or NOT_SET].append(item)
+    return groups
+
+
+def by_size(groups: dict[str, list[dict]]) -> list[str]:
+    return sorted(groups, key=lambda name: (name == NOT_SET, -len(groups[name])))
+
+
+def write_analysis_sheet(ws, listings: list[dict], meta: ReportMeta):
     ws.title = "Аналіз"
     for col, width in enumerate((34, 14, 10, 14, 14, 14, 14), start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -247,19 +309,26 @@ def write_analysis_sheet(ws, listings: list[dict], query: str, fetched_at: datet
     types = Counter(item["price_type"] for item in listings)
 
     out = SheetWriter(ws)
-    out.title(f"Аналіз ринку OLX: «{query}»")
-    out.line(f"Дані станом на {fetched_at:%d.%m.%Y %H:%M}")
+    out.title(f"Аналіз ринку OLX: «{meta.query}»")
+    out.line(f"Дані станом на {meta.fetched_at:%d.%m.%Y %H:%M}; фільтри: {meta.filters}")
 
     out.section("Загальне")
-    out.pairs([
-        ("Усього оголошень", total, "0"),
+    rows = []
+    if meta.total_found is not None:
+        rows.append(("Усього на OLX за запитом", meta.total_found, "#,##0"))
+    rows += [
+        ("Оголошень у звіті", total, "#,##0"),
         ("З ціною в гривнях", len(prices), "0"),
         ("Ціна договірна", types.get("Договірна", 0), "0"),
         ("Безкоштовно", types.get("Безкоштовно", 0), "0"),
-        ("Без ціни або інша валюта", total - len(prices) - types.get("Безкоштовно", 0), "0"),
+        ("Обмін", types.get("Обмін", 0), "0"),
         ("ТОП-оголошень (платне просування)", sum(item["promoted"] for item in listings), "0"),
         ("З OLX доставкою", sum(item["delivery"] for item in listings), "0"),
-    ])
+    ]
+    out.pairs(rows)
+    if meta.total_found and meta.total_found > total:
+        out.line(f"OLX віддає щонайбільше 1 000 оголошень на запит, тому статистика порахована "
+                 f"за вибіркою. Звузь запит фільтрами (--city, --min-price, --max-price), щоб охопити все.")
 
     if stats:
         out.section("Ціни, грн (без безкоштовних)")
@@ -276,22 +345,18 @@ def write_analysis_sheet(ws, listings: list[dict], query: str, fetched_at: datet
             out.line("Середня значно вища за медіану: кілька дуже дорогих оголошень "
                      "тягнуть середню вгору, орієнтуйся на медіану.")
 
-    stat_headers = ["Кількість", "Частка", "Середня", "Медіана", "Мін", "Макс"]
-    stat_formats = [None, "0", SHARE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT]
-
-    by_condition = defaultdict(list)
-    for item in listings:
-        by_condition[item["condition"] or NO_CONDITION].append(item)
-    out.section("За станом")
-    order = sorted(by_condition, key=lambda name: (name == NO_CONDITION, -len(by_condition[name])))
-    out.table(["Стан"] + stat_headers, group_stats_rows(by_condition, total, order), stat_formats)
-
-    by_city = defaultdict(list)
-    for item in listings:
-        by_city[item["city"] or NO_CONDITION].append(item)
-    top_cities = sorted(by_city, key=lambda name: -len(by_city[name]))[:10]
-    out.section(f"Міста (топ-{len(top_cities)} за кількістю оголошень)")
-    out.table(["Місто"] + stat_headers, group_stats_rows(by_city, total, top_cities), stat_formats)
+    for title, key, limit in (
+        ("За станом", lambda i: i["condition"], None),
+        ("За типом продавця", seller_label, None),
+        ("Міста (топ-10 за кількістю оголошень)", lambda i: i["city"], 10),
+        ("Області (топ-10)", lambda i: i["region"], 10),
+    ):
+        groups = group_by(listings, key)
+        if set(groups) == {NOT_SET}:
+            continue
+        order = by_size(groups)[:limit]
+        out.section(title)
+        out.table([title.split(" (")[0]] + STAT_HEADERS, group_stats_rows(groups, total, order), STAT_FORMATS)
 
     if prices:
         out.section("Розподіл цін")
@@ -316,18 +381,48 @@ def write_analysis_sheet(ws, listings: list[dict], query: str, fetched_at: datet
     cheapest = sorted((item for item in listings if uah_price(item)), key=uah_price)[:10]
     if cheapest:
         out.section("10 найдешевших оголошень")
-        header_row = out.row
-        out.table(["Назва", "Ціна", "Стан", "Місто", "Посилання"],
-                  [[item["title"], uah_price(item), item["condition"] or NO_CONDITION, item["city"], None]
-                   for item in cheapest],
-                  [None, PRICE_FORMAT, None, None, None])
-        for offset, item in enumerate(cheapest, start=1):
-            set_link(ws.cell(row=header_row + offset, column=5), item["link"])
+        out.ad_table(["Назва", "Ціна", "Стан", "Місто", "Посилання"], cheapest,
+                     lambda i: [i["title"], uah_price(i), i["condition"] or NOT_SET, i["city"], None],
+                     [None, PRICE_FORMAT, None, None, None], link_col=5)
 
 
-def write_report(path: str, listings: list[dict], query: str, fetched_at: datetime, sort_label: str):
+def write_changes_sheet(ws, changes: Changes):
+    ws.title = "Зміни"
+    for col, width in enumerate((55, 14, 14, 10, 18, 11), start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    out = SheetWriter(ws)
+    out.title("Зміни з попереднього запуску")
+    if changes.baseline:
+        out.line("Перший запуск відстеження: усі оголошення збережено як базу. "
+                 "Нові оголошення й зниження цін з'являться тут з наступного запуску.")
+        return
+    if changes.empty:
+        out.line("Нових оголошень і знижень цін немає.")
+        return
+
+    if changes.new:
+        out.section(f"Нові оголошення: {len(changes.new)}")
+        out.ad_table(["Назва", "Ціна", "Стан", "Продавець", "Місто", "Посилання"], changes.new,
+                     lambda i: [i["title"], table_price(i), i["condition"] or NOT_SET, seller_label(i),
+                                i["city"], None],
+                     [None, PRICE_FORMAT, None, None, None, None], link_col=6)
+    if changes.cheaper:
+        out.section(f"Подешевшали: {len(changes.cheaper)}")
+        items = [item for item, _ in changes.cheaper]
+        old_prices = {item["id"]: old for item, old in changes.cheaper}
+        out.ad_table(["Назва", "Було", "Стало", "Зміна", "Місто", "Посилання"], items,
+                     lambda i: [i["title"], old_prices[i["id"]], i["price"],
+                                i["price"] / old_prices[i["id"]] - 1 if old_prices[i["id"]] else None,
+                                i["city"], None],
+                     [None, PRICE_FORMAT, PRICE_FORMAT, PERCENT_FORMAT, None, None], link_col=6)
+
+
+def write_report(path, listings: list[dict], meta: ReportMeta):
     stats = price_stats(uah_prices(listings))
     workbook = Workbook()
-    write_listings_sheet(workbook.active, listings, stats["median"] if stats else None, sort_label)
-    write_analysis_sheet(workbook.create_sheet(), listings, query, fetched_at)
+    write_listings_sheet(workbook.active, listings, stats["median"] if stats else None, meta.sort_label)
+    write_analysis_sheet(workbook.create_sheet(), listings, meta)
+    if meta.changes is not None:
+        write_changes_sheet(workbook.create_sheet(), meta.changes)
     workbook.save(path)

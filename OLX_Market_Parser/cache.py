@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 CACHE_FILE = Path(__file__).with_name("cache.json")
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_TTL = 30 * 60
 CACHE_MAX_AGE = 7 * 24 * 60 * 60
 
@@ -50,10 +50,11 @@ class ListingCache:
     def get(self, key: str) -> dict | None:
         return self.entries.get(key)
 
-    def put(self, key: str, listings: list[dict], capped: bool):
+    def put(self, key: str, listings: list[dict], capped: bool, total_found: int | None = None):
         self.entries[key] = {
             "fetched_at": time.time(),
             "capped": capped,
+            "total_found": total_found,
             "listings": listings,
         }
         self._prune()
