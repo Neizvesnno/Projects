@@ -4,6 +4,8 @@
 
 ## Встановлення
 
+Потрібен Python 3.10 або новіший.
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -43,6 +45,10 @@ python main.py iphone 13 -x "чохол,скло" --city kiev --min-price 8000 -
 | `--delay`, `--workers` | пауза між запитами (с) і кількість паралельних завантажень |
 
 Повний список параметрів: `python main.py --help`.
+
+У PyCharm параметри задаються в Run → Edit Configurations → поле Parameters. Якщо поле порожнє, скрипт запуститься в інтерактивному режимі.
+
+Звіти зберігаються в поточну папку запуску (або за шляхом з `-o`). Кеш `cache.json` і база відстеження `olx_tracker.db` лежать поруч зі скриптом.
 
 ## Звіт Excel
 

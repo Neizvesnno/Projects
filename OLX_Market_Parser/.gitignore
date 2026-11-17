@@ -8,3 +8,4 @@ __pycache__/
 olx_tracker.db
 results.csv
 results.json
+/~$results.xlsx
