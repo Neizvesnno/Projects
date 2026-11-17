@@ -7,17 +7,13 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import random
 import os
 
+from cache import ListingCache, diff_listings
+
 BASE_URL = "https://www.olx.ua/uk/list/q-{query}/"
 MAX_PAGES = 25
 
-data_len: int = 0
-row_numo: int = 0
-search: str
-stop_words: list[str] = []
-seen_ids: set[str] = set()
 
-
-def build_url(page: int) -> str:
+def build_url(search: str, page: int) -> str:
     url = BASE_URL.format(query=search)
     if page > 1:
         url += f"?page={page}"
@@ -38,7 +34,7 @@ def clean_link(href: str, page_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def parse_listings(soup: BeautifulSoup, page_url: str) -> list[list[str]]:
+def parse_listings(soup: BeautifulSoup, page_url: str, seen_ids: set[str]) -> list[dict]:
     grid = soup.select_one('[data-testid="listing-grid"]')
     if grid is None:
         return []
@@ -49,20 +45,19 @@ def parse_listings(soup: BeautifulSoup, page_url: str) -> list[list[str]]:
         if link_tag is None or not link_tag.get("href"):
             continue
 
-        ad_id = card.get("id") or link_tag["href"]
+        link = clean_link(link_tag["href"], page_url)
+        ad_id = card.get("id") or link
         if ad_id in seen_ids:
             continue
         seen_ids.add(ad_id)
 
-        title = link_tag.get_text(" ", strip=True)
         price_tag = card.select_one('[data-testid="ad-price"]')
-        price = price_tag.get_text(" ", strip=True) if price_tag else ""
-
-        lowered = title.lower()
-        if any(word in lowered for word in stop_words):
-            continue
-
-        listings.append([title, price, clean_link(link_tag["href"], page_url)])
+        listings.append({
+            "id": ad_id,
+            "title": link_tag.get_text(" ", strip=True),
+            "price": price_tag.get_text(" ", strip=True) if price_tag else "",
+            "link": link,
+        })
     return listings
 
 
@@ -72,7 +67,54 @@ def get_page_count(soup: BeautifulSoup) -> int:
         return 1
     numbers = [int(a.get_text(strip=True)) for a in pagination.find_all("a")
                if a.get_text(strip=True).isdigit()]
-    return min(max(numbers, default=1), MAX_PAGES)
+    return max(numbers, default=1)
+
+
+def fetch_all(search: str) -> tuple[list[dict], bool]:
+    seen_ids: set[str] = set()
+    soup, page_url = get_soup(build_url(search, 1))
+    total_pages = get_page_count(soup)
+    pages = min(total_pages, MAX_PAGES)
+
+    listings = []
+    for page in range(1, pages + 1):
+        if page > 1:
+            soup, page_url = get_soup(build_url(search, page))
+        found = parse_listings(soup, page_url, seen_ids)
+        listings.extend(found)
+        print(f"Сторінка {page}/{pages}: {len(found)} оголошень")
+
+    capped = total_pages >= MAX_PAGES
+    return listings, capped
+
+
+def apply_stop_words(listings: list[dict], stop_words: list[str]) -> list[dict]:
+    return [item for item in listings
+            if not any(word in item["title"].lower() for word in stop_words)]
+
+
+def format_age(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} хв тому"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} год тому"
+    return f"{hours // 24} дн тому"
+
+
+def print_diff(old_entry: dict, new_listings: list[dict], capped: bool):
+    diff = diff_listings(old_entry["listings"], new_listings)
+    print(f"Порівняно з кешем ({format_age(ListingCache.age(old_entry))}): "
+          f"нових {diff['added']}, зникло {diff['removed']}, "
+          f"змінилась ціна {diff['price_changed']}, змінилась назва {diff['title_changed']}")
+    if capped or old_entry.get("capped"):
+        print(f"Увага: OLX показує лише {MAX_PAGES} сторінок, тож частина «нових» і «зниклих» "
+              f"могла просто зсунутися за межу видачі.")
+
+
+def ask_yes(prompt: str) -> bool:
+    return input(prompt).strip().lower() in ("y", "yes", "т", "так", "д", "да")
 
 
 def save_to_excel(data: list[list[str]]):
@@ -111,44 +153,60 @@ def save_to_excel(data: list[list[str]]):
     workbook.save('results.xlsx')
 
 
-def every_main(kols, soup=None, page_url=None):
-    if soup is None:
-        soup, page_url = get_soup(build_url(kols))
-    data = parse_listings(soup, page_url)
-    if data:
-        save_to_excel(data)
-    return len(data)
+def get_listings(search: str, cache: ListingCache) -> list[dict] | None:
+    entry = cache.get(search)
+
+    if entry is not None and cache.is_fresh(entry):
+        print(f"Є кеш для цього запиту ({format_age(cache.age(entry))}, "
+              f"{len(entry['listings'])} оголошень).")
+        if not ask_yes("Оновити з OLX? [y/N]: "):
+            return entry["listings"]
+
+    try:
+        listings, capped = fetch_all(search)
+    except requests.RequestException as error:
+        if entry is None:
+            print(f"Не вдалося завантажити дані з OLX: {error}")
+            return None
+        print(f"Не вдалося завантажити дані з OLX ({error}). "
+              f"Використовую кеш ({format_age(cache.age(entry))}).")
+        return entry["listings"]
+
+    if not listings:
+        return listings
+
+    if entry is not None:
+        print_diff(entry, listings, capped)
+    cache.put(search, listings, capped)
+    return listings
 
 
 def main():
-    global row_numo, search, data_len, stop_words
-
     try:
         os.remove("results.xlsx")
     except FileNotFoundError:
         pass
 
     query = input("Введіть пошуковий запит: ").strip()
-    search = quote("-".join(query.split()), safe="-")
+    search = quote("-".join(query.lower().split()), safe="-")
+    if not search:
+        print("Порожній запит.")
+        return
 
     raw_stop = input("Слова для виключення через кому (Enter — без фільтра): ")
     stop_words = [w.strip().lower() for w in raw_stop.split(",") if w.strip()]
 
-    soup_first, url_first = get_soup(build_url(1))
-    pages = get_page_count(soup_first)
+    listings = get_listings(search, ListingCache())
+    if listings is None:
+        return
 
-    for ssp in range(1, pages + 1):
-        if ssp == 1:
-            data_len = every_main(ssp, soup_first, url_first)
-        else:
-            data_len = every_main(ssp)
-        row_numo += data_len
-        print(f"Сторінка {ssp}/{pages}: {data_len} оголошень")
-
-    if row_numo == 0:
+    filtered = apply_stop_words(listings, stop_words)
+    if not filtered:
         print("Нічого не знайдено.")
-    else:
-        print(f"Excellent, I found {row_numo} products!")
+        return
+
+    save_to_excel([[item["title"], item["price"], item["link"]] for item in filtered])
+    print(f"Excellent, I found {len(filtered)} products!")
 
 
 if __name__ == "__main__":

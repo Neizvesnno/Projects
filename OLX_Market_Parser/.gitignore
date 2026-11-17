@@ -1,0 +1,7 @@
+cache.json
+.cache-*.tmp
+results.xlsx
+__pycache__/
+.venv/
+.idea/
+.DS_Store
