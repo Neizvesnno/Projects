@@ -19,15 +19,21 @@ SHARE_FORMAT = '0%'
 DATE_FORMAT = 'DD.MM.YYYY HH:MM'
 DAY_FORMAT = 'DD.MM.YYYY'
 
+ACCENT = "23A094"
 HEADER_FONT = Font(bold=True, color="FFFFFF")
-HEADER_FILL = PatternFill("solid", fgColor="23A094")
+HEADER_FILL = PatternFill("solid", fgColor=ACCENT)
 TITLE_FONT = Font(bold=True, size=14)
-SECTION_FONT = Font(bold=True, size=12, color="23A094")
+SECTION_FONT = Font(bold=True, size=12, color=ACCENT)
 NOTE_FONT = Font(italic=True, color="666666")
 NOT_SET = "Не вказано"
 
 
+Bounds = tuple[float, float] | None
+
+
 @dataclass
+
+
 class ReportMeta:
     query: str
     filters: str
@@ -73,6 +79,26 @@ def price_stats(prices: list[float]) -> dict | None:
         "q3": quartiles[2],
         "stdev": statistics.stdev(prices) if len(prices) > 1 else 0.0,
     }
+
+
+def iqr_bounds(prices: list[float]) -> Bounds:
+    """Межі звичайної ціни за правилом Тьюкі: [Q1 − 1,5·IQR; Q3 + 1,5·IQR]."""
+    if len(prices) < 4:
+        return None
+    q1, _, q3 = statistics.quantiles(prices, n=4)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+
+def is_outlier(price: float | None, bounds: Bounds) -> bool:
+    if bounds is None or price is None:
+        return False
+    low, high = bounds
+    return price < low or price > high
+
+
+def without_outliers(prices: list[float], bounds: Bounds) -> list[float]:
+    return [price for price in prices if not is_outlier(price, bounds)]
 
 
 def format_money(value: float) -> str:
@@ -130,7 +156,7 @@ def set_link(cell, url: str, text: str = "Відкрити"):
     cell.style = "Hyperlink"
 
 
-def listing_columns(median: float | None) -> list[tuple]:
+def listing_columns(median: float | None, bounds: Bounds) -> list[tuple]:
     def deviation(item):
         price = uah_price(item)
         return price / median - 1 if price and median else None
@@ -147,6 +173,7 @@ def listing_columns(median: float | None) -> list[tuple]:
         ("Опубліковано/піднято", 17, lambda i: parse_date(i["posted"]), DATE_FORMAT),
         ("Створено", 17, lambda i: parse_date(i["created"]), DATE_FORMAT),
         ("Від медіани", 12, deviation, PERCENT_FORMAT),
+        ("Викид", 8, lambda i: "так" if is_outlier(uah_price(i), bounds) else "", None),
         ("ТОП", 6, lambda i: "так" if i["promoted"] else "", None),
         ("Доставка", 10, lambda i: "так" if i["delivery"] else "", None),
         ("Посилання", 11, "link", None),
@@ -161,9 +188,9 @@ def column_index(columns: list[tuple], header: str) -> int:
     return next(index for index, column in enumerate(columns, start=1) if column[0] == header)
 
 
-def write_listings_sheet(ws, listings: list[dict], median: float | None, sort_label: str):
+def write_listings_sheet(ws, listings: list[dict], median: float | None, bounds: Bounds, sort_label: str):
     ws.title = "Оголошення"
-    columns = listing_columns(median)
+    columns = listing_columns(median, bounds)
     for col, (header, width, _, _) in enumerate(columns, start=1):
         ws.cell(row=1, column=col, value=header)
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -221,7 +248,8 @@ def write_listings_sheet(ws, listings: list[dict], median: float | None, sort_la
         cell.font = Font(bold=True)
     ws.cell(row=row + 2, column=1,
             value=f"Початкове сортування: {sort_label}. Кнопки в заголовку таблиці дозволяють "
-                  f"пересортувати й відфільтрувати за будь-яким стовпцем.").font = NOTE_FONT
+                  f"пересортувати й відфільтрувати за будь-яким стовпцем. Щоб прибрати викиди "
+                  f"з підсумку, відфільтруй стовпець «Викид».").font = NOTE_FONT
 
 
 class SheetWriter:
@@ -274,11 +302,11 @@ STAT_HEADERS = ["Кількість", "Частка", "Середня", "Мед�
 STAT_FORMATS = [None, "0", SHARE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT, PRICE_FORMAT]
 
 
-def group_stats_rows(groups: dict[str, list[dict]], total: int, order: list[str]) -> list[list]:
+def group_stats_rows(groups: dict[str, list[dict]], total: int, order: list[str], bounds: Bounds) -> list[list]:
     rows = []
     for name in order:
         items = groups[name]
-        stats = price_stats(uah_prices(items))
+        stats = price_stats(without_outliers(uah_prices(items), bounds))
         rows.append([
             name, len(items), len(items) / total,
             stats["mean"] if stats else None, stats["median"] if stats else None,
@@ -298,6 +326,27 @@ def by_size(groups: dict[str, list[dict]]) -> list[str]:
     return sorted(groups, key=lambda name: (name == NOT_SET, -len(groups[name])))
 
 
+def add_price_chart(ws, first: int, last: int):
+    chart = BarChart()
+    chart.title = "Кількість оголошень за ціною"
+    chart.x_axis.title = "Ціна, грн"
+    chart.y_axis.title = "Оголошень"
+    chart.legend = None
+    chart.varyColors = False
+    chart.gapWidth = 40
+    # openpyxl 3.1+ ховає осі за замовчуванням: без цього не видно ні діапазонів, ні чисел
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.x_axis.tickLblPos = "low"
+    chart.add_data(Reference(ws, min_col=2, min_row=first, max_row=last), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=first + 1, max_row=last))
+    series = chart.series[0]
+    series.graphicalProperties.solidFill = ACCENT
+    series.graphicalProperties.line.solidFill = ACCENT
+    chart.width, chart.height = 20, 9
+    ws.add_chart(chart, f"I{first}")
+
+
 def write_analysis_sheet(ws, listings: list[dict], meta: ReportMeta):
     ws.title = "Аналіз"
     for col, width in enumerate((34, 14, 10, 14, 14, 14, 14), start=1):
@@ -306,6 +355,10 @@ def write_analysis_sheet(ws, listings: list[dict], meta: ReportMeta):
     total = len(listings)
     prices = uah_prices(listings)
     stats = price_stats(prices)
+    bounds = iqr_bounds(prices)
+    clean_prices = without_outliers(prices, bounds)
+    clean_stats = price_stats(clean_prices)
+    outliers = len(prices) - len(clean_prices)
     types = Counter(item["price_type"] for item in listings)
 
     out = SheetWriter(ws)
@@ -332,18 +385,27 @@ def write_analysis_sheet(ws, listings: list[dict], meta: ReportMeta):
 
     if stats:
         out.section("Ціни, грн (без безкоштовних)")
-        out.pairs([
-            ("Середня", stats["mean"], PRICE_FORMAT),
+        rows = [
+            ("Середня (усі оголошення)", stats["mean"], PRICE_FORMAT),
+            ("Середня без викидів", clean_stats["mean"], PRICE_FORMAT),
             ("Медіана (типова ціна)", stats["median"], PRICE_FORMAT),
             ("Мінімальна", stats["min"], PRICE_FORMAT),
             ("Максимальна", stats["max"], PRICE_FORMAT),
             ("25% оголошень дешевші за", stats["q1"], PRICE_FORMAT),
             ("75% оголошень дешевші за", stats["q3"], PRICE_FORMAT),
-            ("Стандартне відхилення", stats["stdev"], PRICE_FORMAT),
-        ])
-        if stats["mean"] > stats["median"] * 1.3:
-            out.line("Середня значно вища за медіану: кілька дуже дорогих оголошень "
-                     "тягнуть середню вгору, орієнтуйся на медіану.")
+            ("Стандартне відхилення без викидів", clean_stats["stdev"], PRICE_FORMAT),
+        ]
+        if bounds:
+            rows += [
+                ("Межі звичайної ціни (IQR)",
+                 f"{format_money(max(bounds[0], 0))} – {format_money(bounds[1])} грн", None),
+                ("Викидів", outliers, "0"),
+            ]
+        out.pairs(rows)
+        if outliers:
+            out.line(f"Оголошень з ціною поза межами Q1 − 1,5·IQR … Q3 + 1,5·IQR: {outliers}. Вони не враховані "
+                     f"в «Середня без викидів», у таблицях за групами та на графіку. "
+                     f"У таблиці «Оголошення» вони позначені в стовпці «Викид».")
 
     for title, key, limit in (
         ("За станом", lambda i: i["condition"], None),
@@ -355,21 +417,15 @@ def write_analysis_sheet(ws, listings: list[dict], meta: ReportMeta):
         if set(groups) == {NOT_SET}:
             continue
         order = by_size(groups)[:limit]
-        out.section(title)
-        out.table([title.split(" (")[0]] + STAT_HEADERS, group_stats_rows(groups, total, order), STAT_FORMATS)
+        out.section(f"{title}, ціни без викидів" if outliers else title)
+        out.table([title.split(" (")[0]] + STAT_HEADERS,
+                  group_stats_rows(groups, total, order, bounds), STAT_FORMATS)
 
-    if prices:
-        out.section("Розподіл цін")
-        buckets = price_histogram(prices)
+    if clean_prices:
+        out.section("Розподіл цін (без викидів)" if outliers else "Розподіл цін")
+        buckets = price_histogram(clean_prices)
         first, last = out.table(["Діапазон, грн", "Оголошень"], [list(b) for b in buckets], [None, "0"])
-        chart = BarChart()
-        chart.title = "Кількість оголошень за ціною"
-        chart.y_axis.title = "Оголошень"
-        chart.legend = None
-        chart.add_data(Reference(ws, min_col=2, min_row=first, max_row=last), titles_from_data=True)
-        chart.set_categories(Reference(ws, min_col=1, min_row=first + 1, max_row=last))
-        chart.width, chart.height = 18, 8
-        ws.add_chart(chart, f"I{first}")
+        add_price_chart(ws, first, last)
 
     days = Counter(item["posted"][:10] for item in listings if item["posted"])
     if days:
@@ -419,9 +475,11 @@ def write_changes_sheet(ws, changes: Changes):
 
 
 def write_report(path, listings: list[dict], meta: ReportMeta):
-    stats = price_stats(uah_prices(listings))
+    prices = uah_prices(listings)
+    stats = price_stats(prices)
+    bounds = iqr_bounds(prices)
     workbook = Workbook()
-    write_listings_sheet(workbook.active, listings, stats["median"] if stats else None, meta.sort_label)
+    write_listings_sheet(workbook.active, listings, stats["median"] if stats else None, bounds, meta.sort_label)
     write_analysis_sheet(workbook.create_sheet(), listings, meta)
     if meta.changes is not None:
         write_changes_sheet(workbook.create_sheet(), meta.changes)
