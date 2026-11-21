@@ -29,30 +29,50 @@ def format_price(value: float | None, currency: str = "UAH") -> str:
     return f"{amount} грн" if currency in ("UAH", "") else f"{amount} {currency}"
 
 
-def ad_line(item: dict, extra: str = "") -> str:
+def ad_line(item: dict, extra: str = "", source: str = "") -> str:
     title = html.escape(item["title"][:90])
     city = html.escape(item["city"]) if item["city"] else ""
-    details = " · ".join(part for part in (extra or format_price(item["price"], item["currency"]), city) if part)
+    found_by = f"«{html.escape(source)}»" if source else ""
+    details = " · ".join(part for part in (extra or format_price(item["price"], item["currency"]), city, found_by)
+                         if part)
     return f'• <a href="{html.escape(item["link"], quote=True)}">{title}</a>\n  {details}'
 
 
 def format_changes(query: str, filters: str, changes: Changes) -> list[str]:
-    lines = [f"<b>OLX: «{html.escape(query)}»</b> ({html.escape(filters)})"]
-    if changes.new:
-        lines.append(f"\n<b>Нові оголошення: {len(changes.new)}</b>")
-        lines += [ad_line(item) for item in changes.new[:ITEMS_LIMIT]]
-        if len(changes.new) > ITEMS_LIMIT:
-            lines.append(f"…і ще {len(changes.new) - ITEMS_LIMIT}, усі є в звіті")
-    if changes.cheaper:
-        lines.append(f"\n<b>Подешевшали: {len(changes.cheaper)}</b>")
-        for item, old_price in changes.cheaper[:ITEMS_LIMIT]:
+    header = f"<b>OLX: «{html.escape(query)}»</b> ({html.escape(filters)})"
+    return format_combined(header, [(query, changes)], show_source=False)
+
+
+def format_combined(header: str, sections: list[tuple[str, Changes]], show_source: bool = True) -> list[str]:
+    """Об'єднує зміни кількох запитів в одне повідомлення без повторів одного оголошення."""
+    new, cheaper, seen_new, seen_cheaper = [], [], set(), set()
+    for source, changes in sections:
+        label = source if show_source else ""
+        for item in changes.new:
+            if item["id"] not in seen_new:
+                seen_new.add(item["id"])
+                new.append((item, label))
+        for item, old_price in changes.cheaper:
+            if item["id"] not in seen_cheaper and item["id"] not in seen_new:
+                seen_cheaper.add(item["id"])
+                cheaper.append((item, old_price, label))
+
+    lines = [header]
+    if new:
+        lines.append(f"\n<b>Нові оголошення: {len(new)}</b>")
+        lines += [ad_line(item, source=label) for item, label in new[:ITEMS_LIMIT]]
+        if len(new) > ITEMS_LIMIT:
+            lines.append(f"…і ще {len(new) - ITEMS_LIMIT}, усі є в звітах")
+    if cheaper:
+        lines.append(f"\n<b>Подешевшали: {len(cheaper)}</b>")
+        for item, old_price, label in cheaper[:ITEMS_LIMIT]:
             drop = (1 - item["price"] / old_price) * 100 if old_price else 0
             extra = (f"{format_price(old_price, item['currency'])} → "
                      f"{format_price(item['price'], item['currency'])} (−{drop:.0f}%)")
-            lines.append(ad_line(item, extra))
-        if len(changes.cheaper) > ITEMS_LIMIT:
-            lines.append(f"…і ще {len(changes.cheaper) - ITEMS_LIMIT}, усі є в звіті")
-    return split_messages(lines)
+            lines.append(ad_line(item, extra, label))
+        if len(cheaper) > ITEMS_LIMIT:
+            lines.append(f"…і ще {len(cheaper) - ITEMS_LIMIT}, усі є в звітах")
+    return split_messages(lines) if new or cheaper else []
 
 
 def split_messages(lines: list[str]) -> list[str]:

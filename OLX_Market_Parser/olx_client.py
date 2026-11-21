@@ -11,7 +11,7 @@ from urllib3.util.retry import Retry
 
 from olx_parser import parse_page
 
-BASE_URL = "https://www.olx.ua/uk/{location}/q-{query}/"
+BASE_URL = "https://www.olx.ua/uk/{path}/q-{query}/"
 MAX_PAGES = 25
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -26,7 +26,7 @@ ORDERS = {
 SELLERS = ("private", "business")
 
 
-class CityNotFound(Exception):
+class PathNotFound(Exception):
     pass
 
 
@@ -34,6 +34,7 @@ class CityNotFound(Exception):
 class SearchParams:
     query: str
     city: str | None = None
+    category: str | None = None
     min_price: float | None = None
     max_price: float | None = None
     seller: str | None = None
@@ -45,7 +46,8 @@ class SearchParams:
         return quote("-".join(self.query.lower().split()), safe="-")
 
     def url(self) -> str:
-        return BASE_URL.format(location=self.city or "list", query=self.slug)
+        path = "/".join(part for part in (self.category, self.city) if part) or "list"
+        return BASE_URL.format(path=path, query=self.slug)
 
     def request_params(self, page: int) -> dict:
         params = {}
@@ -68,6 +70,8 @@ class SearchParams:
 
     def describe(self) -> str:
         parts = []
+        if self.category:
+            parts.append(f"категорія: {self.category}")
         if self.city:
             parts.append(f"місто: {self.city}")
         if self.min_price is not None or self.max_price is not None:
@@ -137,8 +141,8 @@ class OlxClient:
         try:
             response = self.get(search.url(), search.request_params(page))
         except requests.HTTPError as error:
-            if error.response is not None and error.response.status_code == 404 and search.city:
-                raise CityNotFound(search.city) from error
+            if error.response is not None and error.response.status_code == 404 and (search.city or search.category):
+                raise PathNotFound(search.url()) from error
             raise
         return parse_page(response.content, response.url)
 

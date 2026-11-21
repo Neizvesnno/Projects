@@ -3,3 +3,6 @@
 # --order new: нові оголошення завжди на перших сторінках, тож жодне не загубиться.
 
 iphone 13 --city kiev --max-price 15000 -x "чохол,скло" --order new
+
+# Кілька запитів на ті самі речі можна тримати разом: однакові оголошення прийдуть один раз.
+iphone 13 --category elektronika/telefony-i-aksesuary/mobilnye-telefony-smartfony --city kiev --max-price 15000 --order new

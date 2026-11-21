@@ -1,6 +1,8 @@
 import argparse
+import html
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,11 +11,11 @@ import requests
 
 from cache import ListingCache, diff_listings
 from export import write_csv, write_json
-from notify import NotifyError, format_changes, send_telegram, telegram_credentials
-from olx_client import MAX_PAGES, ORDERS, SELLERS, CityNotFound, OlxClient, SearchParams
+from notify import NotifyError, format_changes, format_combined, send_telegram, telegram_credentials
+from olx_client import MAX_PAGES, ORDERS, SELLERS, OlxClient, PathNotFound, SearchParams
 from olx_parser import KNOWN_CONDITIONS
 from report import ReportMeta, write_report
-from tracker import Tracker
+from tracker import Changes, Tracker
 
 CONDITION_ORDER = {name: index for index, name in enumerate(KNOWN_CONDITIONS)}
 FORMATS = ("xlsx", "csv", "json")
@@ -80,6 +82,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("query", nargs="*", help="пошуковий запит, напр. iphone 13")
     parser.add_argument("-x", "--exclude", default="", help="стоп-слова через кому, напр. \"чохол,скло\"")
     parser.add_argument("--city", help="місто в адресі OLX латиницею: kiev, lvov, kharkov, odessa, dnepr…")
+    parser.add_argument("--category", help="шлях категорії з адреси OLX, напр. moda-i-stil/aksessuary/sumki")
     parser.add_argument("--min-price", type=positive_float, help="мінімальна ціна, грн")
     parser.add_argument("--max-price", type=positive_float, help="максимальна ціна, грн")
     parser.add_argument("--seller", choices=SELLERS, help="тільки приватні особи або бізнес")
@@ -125,6 +128,7 @@ def options_from_args(argv: list[str]) -> Options:
         search=SearchParams(
             query=query,
             city=args.city.strip().lower() if args.city else None,
+            category=args.category.strip().strip("/").lower() or None if args.category else None,
             min_price=args.min_price,
             max_price=args.max_price,
             seller=args.seller,
@@ -204,8 +208,9 @@ def get_listings(opts: Options, client: OlxClient, cache: ListingCache) -> Snaps
 
     try:
         result = client.fetch_all(opts.search)
-    except CityNotFound as error:
-        print(f"OLX не знає міста «{error}». Візьми назву з адреси сайту, напр. kiev, lvov, kharkov.")
+    except PathNotFound as error:
+        print(f"OLX не знайшов сторінку {error}. Перевір --city і --category: їх треба брати з адреси сайту, "
+              f"напр. kiev або moda-i-stil/aksessuary/sumki.")
         return None
     except requests.RequestException as error:
         reason = error.__class__.__name__
@@ -257,59 +262,128 @@ def write_outputs(opts: Options, listings: list[dict], meta: ReportMeta) -> list
     return written
 
 
-def run_once(opts: Options, client: OlxClient, cache: ListingCache, tracker: Tracker | None) -> bool:
+@dataclass
+class SearchResult:
+    opts: Options
+    changes: Changes | None
+
+
+def collect(opts: Options, client: OlxClient, cache: ListingCache, tracker: Tracker | None) -> SearchResult | None:
+    """Завантажує видачу, записує зміни в базу (без commit) і зберігає звіт."""
     snapshot = get_listings(opts, client, cache)
     if snapshot is None:
-        return False
+        return None
 
     listings = apply_stop_words(snapshot.listings, opts.stop_words)
     if not listings:
         print("Нічого не знайдено.")
-        return True
+        return SearchResult(opts, None)
 
-    changes = None
-    if tracker is not None:
-        changes = tracker.track(opts.search.cache_key(), listings)
+    label, sorter = SORT_MODES[opts.sort]
+    try:
+        with tracker.step() if tracker is not None else nullcontext():
+            changes = None
+            if tracker is not None:
+                changes = tracker.track(opts.search.cache_key(), listings)
+            meta = ReportMeta(
+                query=opts.search.query,
+                filters=opts.search.describe(),
+                fetched_at=datetime.fromtimestamp(snapshot.fetched_at),
+                sort_label=label,
+                total_found=snapshot.total_found,
+                changes=changes,
+            )
+            written = write_outputs(opts, sorter(listings), meta)
+    except PermissionError as error:
+        print(f"Не вдалося записати {error.filename}: закрий файл в Excel і запусти ще раз.")
+        return None
+
+    if changes is not None:
         if changes.baseline:
             print(f"Відстеження почато: {len(listings)} оголошень збережено як базу. "
                   f"Зміни буде видно з наступного запуску.")
         else:
             print(f"Нових оголошень: {len(changes.new)}, подешевшали: {len(changes.cheaper)}.")
-
-    label, sorter = SORT_MODES[opts.sort]
-    meta = ReportMeta(
-        query=opts.search.query,
-        filters=opts.search.describe(),
-        fetched_at=datetime.fromtimestamp(snapshot.fetched_at),
-        sort_label=label,
-        total_found=snapshot.total_found,
-        changes=changes,
-    )
-
-    try:
-        written = write_outputs(opts, sorter(listings), meta)
-    except PermissionError as error:
-        if tracker is not None:
-            tracker.rollback()
-        print(f"Не вдалося записати {error.filename}: закрий файл в Excel і запусти ще раз.")
-        return False
-
-    if tracker is not None:
-        if opts.notify and changes is not None and not changes.baseline and not changes.empty:
-            token, chat_id = telegram_credentials()
-            try:
-                send_telegram(token, chat_id, format_changes(opts.search.query, opts.search.describe(), changes))
-                print("Зміни надіслано в Telegram.")
-            except NotifyError as error:
-                tracker.rollback()
-                print(f"Не вдалося надіслати в Telegram ({error}). Зміни не позначено як переглянуті, "
-                      f"їх буде надіслано наступного разу.")
-                return False
-        tracker.commit()
-
     total = f" з {snapshot.total_found:,} на OLX".replace(",", " ") if snapshot.total_found else ""
     print(f"Знайдено {len(listings)} оголошень{total}. Збережено: {', '.join(str(p) for p in written)}")
+    return SearchResult(opts, changes)
+
+
+def deliver(tracker: Tracker, messages: list[str]) -> bool:
+    """Надсилає повідомлення і лише тоді фіксує зміни в базі. Інакше відкочує все,
+    щоб ці самі зміни прийшли наступного разу."""
+    if messages:
+        token, chat_id = telegram_credentials()
+        try:
+            send_telegram(token, chat_id, messages)
+            print("Зміни надіслано в Telegram.")
+        except NotifyError as error:
+            tracker.rollback()
+            print(f"Не вдалося надіслати в Telegram ({error}). Зміни не позначено як переглянуті, "
+                  f"їх буде надіслано наступного разу.")
+            return False
+    tracker.commit()
     return True
+
+
+def run_once(opts: Options, client: OlxClient, cache: ListingCache, tracker: Tracker | None) -> bool:
+    result = collect(opts, client, cache, tracker)
+    if tracker is None:
+        return result is not None
+    if result is None:
+        tracker.rollback()
+        return False
+    changes = result.changes
+    messages = []
+    if opts.notify and changes is not None and not changes.baseline:
+        messages = format_changes(opts.search.query, opts.search.describe(), changes)
+    return deliver(tracker, messages)
+
+
+def run_batch(argv_list: list[list[str]], log=print) -> int:
+    """Проганяє кілька запитів зі спільною базою і надсилає одне повідомлення без дублів.
+    Повертає кількість запитів, що завершилися помилкою."""
+    searches = []
+    for argv in argv_list:
+        try:
+            opts = options_from_args(argv)
+        except SystemExit:
+            log(f"Пропускаю запит з неправильними параметрами: {' '.join(argv)}")
+            continue
+        opts.track = True
+        searches.append(opts)
+    failed = len(argv_list) - len(searches)
+    if not searches:
+        return failed
+
+    client = OlxClient(delay=min(o.delay for o in searches), workers=max(o.workers for o in searches))
+    cache = ListingCache()
+    tracker = Tracker()
+    try:
+        # Запити, що запускаються вперше, ідуть останніми: запис їхньої бази
+        # не повинен сховати справжні новинки від інших запитів.
+        searches.sort(key=lambda o: tracker.is_baseline(o.search.cache_key()))
+        sections = []
+        for opts in searches:
+            log(f"Запит: {opts.search.query} ({opts.search.describe()})")
+            try:
+                result = collect(opts, client, cache, tracker)
+            except Exception as error:
+                log(f"Помилка: {error.__class__.__name__}: {error}")
+                result = None
+            if result is None:
+                failed += 1
+            elif result.changes is not None and not result.changes.baseline:
+                sections.append((opts.search.query, result.changes))
+
+        notify = any(o.notify for o in searches)
+        queries = ", ".join(f"«{html.escape(o.search.query)}»" for o in searches)
+        messages = format_combined(f"<b>OLX: {queries}</b>", sections) if notify else []
+        if not deliver(tracker, messages):
+            failed = len(argv_list)
+    finally:
+        tracker.close()
+    return failed
 
 
 def main(argv: list[str] | None = None) -> int:

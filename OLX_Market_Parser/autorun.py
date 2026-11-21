@@ -111,17 +111,12 @@ def main() -> int:
 
     import main as parser_main
 
-    failed = 0
-    for number, args in enumerate(searches, start=1):
-        log(f"Запит {number}: {' '.join(args)}")
-        try:
-            code = parser_main.main(args + ["--notify"] + output_args(args, number))
-        except SystemExit as error:
-            code = error.code if isinstance(error.code, int) else 1
-        except Exception as error:
-            log(f"Помилка: {error.__class__.__name__}: {error}")
-            code = 1
-        failed += code != 0
+    batch = [args + ["--notify"] + output_args(args, number) for number, args in enumerate(searches, start=1)]
+    try:
+        failed = parser_main.run_batch(batch, log=log)
+    except Exception as error:
+        log(f"Помилка: {error.__class__.__name__}: {error}")
+        failed = len(searches)
 
     log(f"Готово, з помилками: {failed} з {len(searches)}")
     return 1 if failed else 0

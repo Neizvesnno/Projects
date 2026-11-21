@@ -31,6 +31,7 @@ python main.py iphone 13 -x "чохол,скло" --city kiev --min-price 8000 -
 | `query` | пошуковий запит |
 | `-x`, `--exclude` | стоп-слова через кому, оголошення з ними в назві відкидаються |
 | `--city` | місто з адреси OLX: `kiev`, `lvov`, `kharkov`, `odessa`, `dnepr`, `zhitomir`… |
+| `--category` | категорія з адреси OLX, напр. `moda-i-stil/aksessuary/sumki` |
 | `--min-price`, `--max-price` | діапазон цін, грн (фільтрує сам OLX) |
 | `--seller private\|business` | тільки приватні особи або тільки бізнес |
 | `--order relevance\|cheap\|expensive\|new` | порядок видачі на OLX |
@@ -68,7 +69,7 @@ export TELEGRAM_CHAT_ID="твій chat id"
 python main.py iphone 13 --city kiev --max-price 15000 --notify --every 30
 ```
 
-- Історія зберігається в `olx_tracker.db` (SQLite).
+- Історія зберігається в `olx_tracker.db` (SQLite). Кожне оголошення записане один раз за своїм ID, тож якщо кілька запитів знаходять ту саму річ, про неї прийде одне сповіщення, а не кілька.
 - Перший запуск лише записує базу. Зміни показуються з другого запуску, щоб не отримати сповіщення про всі оголошення одразу.
 - Якщо надіслати повідомлення в Telegram не вдалося, зміни не позначаються як переглянуті і будуть надіслані наступного разу.
 
@@ -94,6 +95,8 @@ python main.py iphone 13 --city kiev --max-price 15000 --notify --every 30
 | `.venv/bin/python autorun_setup.py install --every 60` | змінити інтервал |
 | `.venv/bin/python autorun_setup.py install --reset-token` | ввести новий токен |
 | `.venv/bin/python autorun_setup.py uninstall` | вимкнути автозапуск |
+
+Усі запити з `searches.txt` проганяються по черзі за одну перевірку, а зміни приходять у бот одним повідомленням без повторів. Біля кожного оголошення видно, яким запитом його знайдено. Новий запит під час першої перевірки лише записує базу, тож потоку старих оголошень не буде.
 
 Після редагування `searches.txt` нічого перезапускати не треба, зміни підхопляться під час наступної перевірки. Звіти кожного запиту лежать у `reports/search-N.xlsx`, журнал у `~/Library/Logs/olx-market-parser.log`.
 
